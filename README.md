@@ -6,3 +6,4 @@ My frist learing repository, save my learning process, learning code and some re
 ## Use DistributedDataParallel(DDP) to train my GPT2 on two Nvidia RTX 2080Ti(22GB)
 
 ## Use memory map to load the seqmonkey dataset(32GB)(1 json chunk to 25 npys)
+![s3794979](https://github.com/user-attachments/assets/fd161ec4-a700-4c40-be3c-33478ae8b037)

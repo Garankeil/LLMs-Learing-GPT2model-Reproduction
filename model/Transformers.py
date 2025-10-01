@@ -187,3 +187,4 @@ class GPT(nn.Module):
         print('超过最大长度，生成结束')
         return idx[:, 1:]
 
+

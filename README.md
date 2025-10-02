@@ -47,7 +47,7 @@ My frist learing repository, save my learning process, learning code and some re
 
 
 # Usage:
-> torchrun --nproc_nodes=8 train.py
+> torchrun --nproc_per_node=8 train.py
 
 
 ![s3794979](https://github.com/user-attachments/assets/fd161ec4-a700-4c40-be3c-33478ae8b037)

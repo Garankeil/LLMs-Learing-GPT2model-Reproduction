@@ -4,8 +4,6 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 import math
 
-from torch.cuda.amp import autocast
-
 
 @dataclass
 class GPTconfig:
@@ -17,6 +15,7 @@ class GPTconfig:
     dims: int = 768
     dropout: float = 0.1
     head_dim: int = dims // n_heads
+    n_kv_heads: int = 4
     # vocab_size
     # GPT2官方tokenizer
     vocab_size = 50257
@@ -108,18 +107,79 @@ class FeedForward(nn.Module):
         return self.forward_net(x)
 
 
+class GroupQueryAttention(nn.Module):  # MutiQueryAttention是GQA的n_kv_heads = 1 时的特殊形态， 损失效果更多， 而GQA是MHA和MQA的折中选择
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_heads % config.n_kv_heads == 0
+        assert config.dims % config.n_heads == 0
+        self.query_proj = nn.Linear(config.dims, config.n_heads * config.head_dim)
+        self.key_proj = nn.Linear(config.dims, config.n_kv_heads * config.head_dim)
+        self.value_proj = nn.Linear(config.dims, config.n_kv_heads * config.head_dim)
+        self.output_proj = nn.Linear(config.dims, config.dims)
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        self.dropout = nn.Dropout(config.dropout)
+        self.head_dim = config.head_dim
+
+    def forward(self, x, past_key_value=None, use_cache=False):
+        batch, seq_len, _ = x.size()  # x (batch, seq_len, dims)
+        q = self.query_proj(x)
+        k = self.key_proj(x)
+        v = self.value_proj(x)
+        # 所谓kv cache技术是在推理时应用，推理时第一次计算x序列的全部长度qkv，并缓存这个k和v
+        # 第一次之后后仅计算最后一个token的qkv，然后将之前的kv和现在的拼接
+        # 即每次仅需计算最后一个token，而之前的kv已经保存，可直接用于计算
+        # 为何不缓存之前的q？因为历史token的q并不会被访问，从query的字面意思就能理解
+        # kv cache在x的长度上体现，而不再attn的计算过程中体现
+
+        # attention weight target shape(batch, n_heads, seq_len, seq_len)
+        q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)  # (batch, n_heads, seq_len, head_dims)
+        k = k.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (batch, n_kv_heads, seq_len, head_dims)
+        v = v.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (batch, n_kv_heads, seq_len, head_dims)
+
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        present = (k.detach(), v.detach()) if use_cache else None
+
+        # n_kv_heads 是 n_heads 的分组 需要Repeat
+        k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+        v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+
+        total_len = k.size(2)
+        mask = torch.tril(torch.ones(total_len, total_len, device=x.device))
+        mask = mask[-seq_len:, :total_len]
+
+        # attention score
+        attention_score = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+        attention_score = attention_score.masked_fill(mask == 0,float('-inf'))  # 加入mask（decoder）
+        attention_prob = torch.softmax(attention_score, dim=-1)
+        # dropout
+        attention_prob = self.dropout(attention_prob)
+
+        output = attention_prob @ v  # attention_score(batch, n_heads, seq_len, seq_len) * v(batch, n_heads, seq_len, head_dims)
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)  # (batch, seq_len, dims)
+        output = self.output_proj(output)
+        output = self.dropout(output)
+
+        return output, present
+
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.MHA = MutiHeadAttention(config)
+        # self.MHA = MutiHeadAttention(config)
+        self.GQA = GroupQueryAttention(config)
         self.FFN = FeedForward(config)
         self.layernorm1 = nn.LayerNorm(config.dims)
         self.layernorm2 = nn.LayerNorm(config.dims)
 
-    def forward(self, x):
-        x = x + self.MHA(self.layernorm1(x))
+    def forward(self, x, past_key_value=None, use_cache=False):
+        attn_output, present = self.GQA(self.layernorm1(x), past_key_value=past_key_value, use_cache=use_cache)  # 输入是上一个token的kv, 输出现在的kv
+        x = x + attn_output
         x = x + self.FFN(self.layernorm2(x))
-        return x
+        return x, present
 
 
 class GPT(nn.Module):
@@ -128,8 +188,8 @@ class GPT(nn.Module):
         self.max_seq_len = config.max_seq_len
         self.token_embedding_table = nn.Embedding(config.vocab_size, config.dims)
         self.position_embedding_table = nn.Embedding(config.max_seq_len, config.dims)
-        self.blocks = nn.Sequential(
-            *[Block(config) for _ in range(config.n_block)]
+        self.blocks = nn.ModuleList(
+            [Block(config) for _ in range(config.n_block)]
             # *号将列表解包，作为独立参数传进sequential，ModuleList接收list，而Sequential接收独立参数
         )
         self.layernorm_final = nn.LayerNorm(config.dims)
@@ -146,7 +206,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0, std=0.02)
 
-    def forward(self, token_idx, target_idx=None):
+    def forward(self, token_idx, target_idx=None, past_key_value=None, use_cache=False):
         # 两个输入的Shape要一样
         batch, seq_len = token_idx.size()  # (batch, seq_len)
         token_emb = self.token_embedding_table(token_idx)  # (batch, seq_len, dims) words的向量映射
@@ -155,9 +215,18 @@ class GPT(nn.Module):
         )
         # 经典题目：为何token_emb和posi_emb可以相加
         x = token_emb + posi_emb  # (batch, seq_len, dims)
-        x = self.blocks(x)
+
+        # x = self.blocks(x)
+        presents = [] if use_cache else None
+        for i, block in enumerate(self.blocks):
+            past = past_key_value[i] if past_key_value is not None else None
+            x, present = block(x, past_key_value=past, use_cache=use_cache)  # Past -> Present
+            if use_cache:
+                presents.append(present)
+
         x = self.layernorm_final(x)
         logits = self.FFN_final(x)  # (batch, seq_len, vocab_size)
+
         if target_idx is None:
             loss = None
         else:
@@ -166,25 +235,42 @@ class GPT(nn.Module):
             target_idx = target_idx.view(batch * seq_len)
             # print("Logits shape:", logits.shape)  # 应为 [batch_size, num_classes, ...]
             # print("Target shape:", target_idx.shape)  # 应为 [batch_size, ...]
-            loss = F.cross_entropy(logits,
-                                   target_idx)  # logits(all_seq_len, vocab_size), targets(all_seq_len) but its value is vocab number
+            loss = F.cross_entropy(logits, target_idx)  # logits(all_seq_len, vocab_size), targets(all_seq_len) but its value is vocab number
 
-        return logits, loss
+        return logits, loss, tuple(presents) if use_cache else None
 
-    def generate(self, idx):
-        i = 0
-        for i in range(self.max_seq_len):
-            idx_current = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
-            # print(idx_current)
-            logits, _ = self.forward(idx_current, None)
+    def generate(self, idx, max_new_tokens:int = 512):
+        self.eval()
+        past = None
+        idx = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
+        generated = idx.clone()
+        for i in range(max_new_tokens):
+            # frist send whole sequence:
+            if past is None:
+                idx_current = generated
+            else:
+                idx_current = generated[:, -1:].clone()
+            logits, _, past = self.forward(idx_current, None, past_key_value=past, use_cache=True)  # (past -> present)
+            # kv cache: 1.generate:将上一token计算得到的KV传入GPT.forward，得到现在的token的kv，循环往复。
+            # kv cache: 2.GPT.forward:将每一个block的past_kv分别传入到对应的block，使用ModuleList索引来实现
+            # kv cache: 3.blocks(attention):输入的是每个block对应的上一token的kv矩阵，其与现在的kv矩阵进行seq维度的concat，然后返回
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, 1)
             # print(idx_next)
-            idx = torch.cat([idx_current, idx_next], dim=1)
-            if idx_next == 50256:
+            generated = torch.cat([generated, idx_next], dim=1)
+            if idx_next.item() == 50256:
                 return idx[:, -i:-1]
         print('超过最大长度，生成结束')
-        return idx[:, 1:]
+        return generated[:, 1:]
 
+# xx = torch.ones(12,12).to(torch.long)  # (batch, seq_len, dims)
+# yy = torch.zeros(12,12).to(torch.long)
+# net = GPT(GPTconfig)
+# logitss, losss, _ = net(xx, yy)
+# print(logitss, losss)
 
+# model = GPT(GPTconfig()).to('cpu')
+# input_ids = torch.tensor([[10, 20, 30]], device='cpu')
+# out = model.generate(input_ids)
+# print(out)

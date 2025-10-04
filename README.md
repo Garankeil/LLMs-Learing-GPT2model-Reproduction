@@ -1,7 +1,7 @@
 # LLMs-Learing-GPT2model-Reproduction
 My frist learing repository, save my learning process, learning code and some results.
 
-- GPT2 model created from bilibili.chaofa
+- GPT2 model created from bilibili.chaofa用代码打点酱油
 - Use DistributedDataParallel(DDP) to train my GPT2 on two Nvidia RTX 2080Ti(22GB)
 - Use memory map to load the seqmonkey dataset(32GB)(1 json chunk to 25 npys)
 - Use argparse to manage parameters
@@ -14,10 +14,14 @@ My frist learing repository, save my learning process, learning code and some re
 - Params from GPT2-Small (dims=768, max_seq_len=512, N_blocks = 12 ...)
   > in model/Transformers.py
 
-- for the future:
-  - kv cache
-  - Group Query Attention
-  aims to reduce the GPU memory usage
+- Use kv cache to speed inference process
+  - just in GPT.generate(x), x's length was cut to 1
+  - the k and v matrix of the past token was cached
+  - when new token was put in attention process, the new k and v matrix of new token concat with kv_old
+ 
+- Use GroupQueryAttention(GQA) instead of MHA
+  - reduce the K and V heads to half or less of Q heads
+  - When calculating the attention score, the head number of K and V was repeated to heads of Q  
 
 
 ## Dataset prepocessing
@@ -47,7 +51,7 @@ My frist learing repository, save my learning process, learning code and some re
 
 
 # Usage:
-> torchrun --nproc_per_node=8 train.py
+> torchrun --nproc_per_node=2 train.py
 
 
 ![s3794979](https://github.com/user-attachments/assets/fd161ec4-a700-4c40-be3c-33478ae8b037)

@@ -47,7 +47,7 @@ My frist learing repository, save my learning process, learning code and some re
   - After the training begins, two GPUs each calculate the forward propagation, and during backpropagation, they synchronize gradients through nccl communication to achieve consistent parameters. 
   - Gradient transfer is performed simultaneously with backward propagation. (All reduce)
   - Each GPU has the gradient from other GPUs, and calculate the avarage of the gradients to update the model params.
-  > Offcial document of Pytorch (https://docs.pytorch.org/docs/stable/notes/ddp.html)
+  > Offcial document of DDP (https://docs.pytorch.org/docs/stable/notes/ddp.html)
 
 
 # Usage:

@@ -239,30 +239,36 @@ class GPT(nn.Module):
 
         return logits, loss, tuple(presents) if use_cache else None
 
-    def generate(self, idx, max_new_tokens:int = 512):
+    def generate(self, idx, max_new_tokens: int = 512):
         self.eval()
         past = None
+        # 仅用于上下文，不再复制
         idx = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
-        generated = idx.clone()
+
+        generated_tokens = []  # 专门存储新生成的token
+
         for i in range(max_new_tokens):
-            # frist send whole sequence:
+            # 首次：传入整个序列；之后只传入最后一个token
             if past is None:
-                idx_current = generated
+                idx_current = idx
             else:
-                idx_current = generated[:, -1:].clone()
-            logits, _, past = self.forward(idx_current, None, past_key_value=past, use_cache=True)  # (past -> present)
-            # kv cache: 1.generate:将上一token计算得到的KV传入GPT.forward，得到现在的token的kv，循环往复。
-            # kv cache: 2.GPT.forward:将每一个block的past_kv分别传入到对应的block，使用ModuleList索引来实现
-            # kv cache: 3.blocks(attention):输入的是每个block对应的上一token的kv矩阵，其与现在的kv矩阵进行seq维度的concat，然后返回
+                idx_current = next_token  # 只传入上一个新token
+
+            logits, _, past = self.forward(idx_current, None, past_key_value=past, use_cache=True)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, 1)
-            # print(idx_next)
-            generated = torch.cat([generated, idx_next], dim=1)
-            if idx_next.item() == 50256:
-                return idx[:, -i:-1]
-        print('超过最大长度，生成结束')
-        return generated[:, 1:]
+            next_token = torch.multinomial(probs, 1)
+            generated_tokens.append(next_token)
+
+            # 如果遇到结束标志，则提前停止
+            if next_token.item() == 50256:
+                break
+
+        # 拼接所有生成token并返回
+        if len(generated_tokens) > 0:
+            return torch.cat(generated_tokens, dim=1)
+        else:
+            return torch.empty((idx.size(0), 0), dtype=torch.long, device=idx.device)
 
 # xx = torch.ones(12,12).to(torch.long)  # (batch, seq_len, dims)
 # yy = torch.zeros(12,12).to(torch.long)
@@ -270,7 +276,7 @@ class GPT(nn.Module):
 # logitss, losss, _ = net(xx, yy)
 # print(logitss, losss)
 
-# model = GPT(GPTconfig()).to('cpu')
-# input_ids = torch.tensor([[10, 20, 30]], device='cpu')
-# out = model.generate(input_ids)
-# print(out)
+model = GPT(GPTconfig()).to('cpu')
+input_ids = torch.tensor([[10, 20, 30]], device='cpu')
+out = model.generate(input_ids)
+print(out.shape)

@@ -1,19 +1,21 @@
+import argparse
+import datetime
 import hashlib
-from itertools import islice
-import torch
-import tiktoken
-import time
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset, IterableDataset
-from model.Transformers import GPT, GPTconfig
 import json
 import os
-import argparse
+import psutil
+import time
+from itertools import islice
 import numpy as np
+import tiktoken
+import torch
 import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from model.Transformers import GPT, GPTconfig
 
 
 class Mydataset(Dataset):
@@ -149,15 +151,18 @@ class LineChunkDataset(Dataset):
             key=lambda x: int(x.split('_')[-1].split('.')[0])  # 按文件名数字排序
         )
         self.max_seq_len = max_seq_len
+
+        # 提前mmap所有文件，不加载到内存，只是建立文件索引
+        self.data_arrays = [np.load(f, mmap_mode='r') for f in self.chunk_files]
+
         self.cumulative_chunks = self._precompute_offsets()  # 预计算每个文件的chunk偏移量
 
     def _precompute_offsets(self):
         """预计算每个文件的chunk起始索引"""
         cumulative_chunks = []
         total = 0
-        for file in self.chunk_files:
-            data = np.load(file, mmap_mode='r')
-            cumulative_chunks.append((file, total, total + len(data)))
+        for data in self.data_arrays:
+            cumulative_chunks.append((data, total, total + len(data)))
             total += len(data)
         return cumulative_chunks
 
@@ -166,10 +171,9 @@ class LineChunkDataset(Dataset):
 
     def __getitem__(self, idx):
         """根据全局idx定位到具体文件和chunk"""
-        for file, start, end in self.cumulative_chunks:
+        for data, start, end in self.cumulative_chunks:
             if start <= idx < end:
-                data = np.load(file, mmap_mode='r')
-                chunk = data[idx - start].copy()
+                chunk = np.array(data[idx - start], copy=True)
                 x = torch.from_numpy(chunk[:-1]).long()
                 y = torch.from_numpy(chunk[1:]).long()
                 return x, y
@@ -188,10 +192,11 @@ def parse_args():
     parser.add_argument('--val-batch-size', type=int, default=8, help='验证batch大小')
     parser.add_argument('--lr', type=float, default=3e-4, help='学习率')
     parser.add_argument('--epochs', type=int, default=2, help='训练轮数')
-    parser.add_argument('--num-workers', type=int, default=16, help='数据加载线程数')
+    parser.add_argument('--num-workers', type=int, default=8, help='数据加载线程数')
 
     # 模型保存相关
     parser.add_argument('--save-dir', type=str, default='model_save', help='模型保存目录')
+    parser.add_argument('--save-step-interval', type=int, default=100000, help='每隔多少batch step保存一次模型')
     parser.add_argument('--save-interval', type=int, default=1, help='每隔多少epoch保存一次模型')
 
     # 其他参数
@@ -207,15 +212,18 @@ def sec_to_hms(seconds):
     return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
 
 
-def train(model_t, optimizer_t, scheduler_t, train_loader_t, rank_t, writer_t, scaler):
+proc = psutil.Process(os.getpid())
+
+
+def train(model_t, optimizer_t, scheduler_t, train_loader_t, rank_t, writer_t, scaler, save_path, epoch_t):
     model_t.train()
-    log_step = 0
+    step = 0
     print_time = time.time()
     batch_len = len(train_loader_t)
     for batch_idx, (x, y) in enumerate(train_loader_t):
         x, y = x.to(model_t.device), y.to(model_t.device)
         with torch.autocast(device_type='cuda', dtype=torch.float16):  # amp
-            logits, loss = model_t(token_idx=x, target_idx=y)  # rank0广播model buffer给其他GPU
+            logits, loss, _ = model_t(token_idx=x, target_idx=y)  # rank0广播model buffer给其他GPU
         # 反向传播
         optimizer_t.zero_grad()
         # loss.backward()  # 每个rank的每个参数梯度求平均（all reduce）进程是实时进行的， 并不是训练完一个batch在统一
@@ -228,12 +236,25 @@ def train(model_t, optimizer_t, scheduler_t, train_loader_t, rank_t, writer_t, s
 
         # lr
         scheduler_t.step()
+        if batch_idx == batch_len // 2 and rank_t == 0:
+            os.makedirs(save_path, exist_ok=True)
+            checkpoint = {
+                'model': model_t.module.state_dict(),
+                'optimizer': optimizer_t.state_dict()
+            }
+            save_path = os.path.join(save_path, f'model_epoch_{epoch_t}_batch_{batch_idx}.pt')
+            torch.save(checkpoint, save_path)
+            print(f'checkpoint has been saved at {save_path}!')
+
         if batch_idx % 100 == 0 and rank_t == 0:
-            writer_t.add_scalar('Batch Loss', loss.item(), log_step)
-            print(f'Batch: {batch_idx}, Loss: {loss.item():.4f}, Time: {sec_to_hms(time.time() - print_time)},'
-                  f' Remaintime: {sec_to_hms((time.time() - print_time) * (batch_len - batch_idx + 1) // 100)}')
+            writer_t.add_scalar('Batch Loss', loss.item(), step)
+            writer_t.add_scalar("Memory/CPU_MB", proc.memory_info().rss / 1024**2, step)
+            print(f'Batch: [{batch_idx}/{batch_len}], Loss: {loss.item():.4f}, BatchTime: {sec_to_hms(time.time() - print_time)},'
+                  f' PredRemainTime: {sec_to_hms((time.time() - print_time) * (batch_len - batch_idx + 1) // 100)},'
+                  f' Memory/CPU: {(proc.memory_info().rss / 1024**2):.2f} MB')
             print_time = time.time()
-            log_step += 1
+            step += 1
+
     dist.reduce(loss, dst=0)  # rank0汇总其他GPU的的loss
     return loss
 
@@ -244,7 +265,7 @@ def val(model_e, val_loader_e, rank_e):
     with torch.no_grad():
         for x, y in val_loader_e:
             x, y = x.to(f'cuda:{rank_e}'), y.to(f'cuda:{rank_e}')
-            logits, loss = model_e(token_idx=x, target_idx=y)
+            logits, loss, _ = model_e(token_idx=x, target_idx=y)
             eval_loss += loss.item()
     avg_loss = eval_loss / len(val_loader_e)
     return avg_loss
@@ -265,7 +286,7 @@ def main():
 
     writer = SummaryWriter('logs_train')
 
-    dist.init_process_group(backend='nccl')  # 集合通讯协议，其余GPU连接Master(互认)
+    dist.init_process_group(backend='nccl', timeout=datetime.timedelta(hours=24))  # 集合通讯协议，其余GPU连接Master(互认)
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -296,13 +317,13 @@ def main():
 
     # chunkdataset
     chunkdataset = LineChunkDataset(args.dataset_path, max_seq_len=args.max_seq_len)
-    train_dataset_chunk, val_dataset_chunk = torch.utils.data.random_split(chunkdataset, [0.9, 0.1])  # 将训练集分 10% 作为验证集
+    train_dataset_chunk, val_dataset_chunk = torch.utils.data.random_split(chunkdataset, [0.998, 0.002])  # 将训练集分 10% 作为验证集
 
     sampler = DistributedSampler(train_dataset_chunk)  # 指派子集给各个GPU
     train_dataloader_chunk = DataLoader(train_dataset_chunk, batch_size=args.train_batch_size, num_workers=args.num_workers,
                                         sampler=sampler, persistent_workers=True)
 
-    val_dataloader_chunk = DataLoader(val_dataset_chunk, batch_size=args.val_batch_size, num_workers=2,
+    val_dataloader_chunk = DataLoader(val_dataset_chunk, batch_size=args.val_batch_size, num_workers=args.num_workers,
                                       shuffle=True, persistent_workers=True)
     if rank == 0:
         print(f'rank{rank} train dataset size: {len(train_dataset_chunk)}')
@@ -318,16 +339,11 @@ def main():
         sampler.set_epoch(epoch)  # 生成随机种子， rank0广播给其他GPU
         if rank == 0:
             print('<----------Train Process---------->')
-        train_loss = train(model, optimizer, scheduler, train_dataloader_chunk, rank, writer, scaler)
+
+        train_loss = train(model, optimizer, scheduler, train_dataloader_chunk, rank, writer, scaler, args.save_dir, epoch)
+
         if rank == 0:
             avg_train_loss = train_loss / world_size
-
-            # evaluate
-            print('<----------Val Process---------->')
-            raw_model = model.module
-            avg_val_loss = val(raw_model, val_dataloader_chunk, rank)
-            print(f'Epoch: {epoch}, Train_loss: {avg_train_loss:.4f}, val_loss: {avg_val_loss:.4f}')
-            writer.add_scalars('avg_Loss', {'train': avg_train_loss, 'val': avg_val_loss}, epoch + 1)
 
             # save
             if epoch % args.save_interval == 0 or epoch == args.epochs - 1:
@@ -338,6 +354,15 @@ def main():
                 }
                 save_path = os.path.join(args.save_dir, f'model_epoch_{epoch}.pt')
                 torch.save(checkpoint, save_path)
+                print(f'checkpoint has been saved at {save_path}!')
+
+            # evaluate
+            print('<----------Val Process---------->')
+            raw_model = model.module
+            avg_val_loss = val(raw_model, val_dataloader_chunk, rank)
+            print(f'Epoch: {epoch}, Train_loss: {avg_train_loss:.4f}, val_loss: {avg_val_loss:.4f}')
+            writer.add_scalars('avg_Loss', {'train': avg_train_loss, 'val': avg_val_loss}, epoch + 1)
+
         dist.barrier()  # 等待rank0完成evaluate
     if rank == 0:
         print('Training Done.')

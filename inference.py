@@ -25,7 +25,6 @@ model = GPT(config)  # 你的模型定义
 # # 检测可用GPU数量
 if torch.cuda.device_count() >= 2:
     print(f"Using {torch.cuda.device_count()} GPUs!")
-    model = torch.nn.DataParallel(model)  # 包装为DataParallel
 
 # 将模型放到设备（默认会复制到所有GPU）
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -36,12 +35,11 @@ print(f"Model is on: {next(model.parameters()).device}")
 print(f"All devices: {[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}")
 
 # 加载 checkpoint
-checkpoint_path = '/home/jnu/jiananfu/project/GPT2/model_save/model_epoch_1.pt'  # 替换为你要加载的 checkpoint 路径
+checkpoint_path = '/home/jnu/jiananfu/project/GPT2/model_save/model_epoch_1_batch_77.pt'  # 替换为你要加载的 checkpoint 路径
 checkpoint = torch.load(checkpoint_path)
 
 # 恢复模型的状态
-model.load_state_dict(checkpoint['model_state_dict'])
-model = model.module
+model.load_state_dict(checkpoint['model'])
 # 将模型设置为评估模式（如果你只是进行推理）
 model.eval()
 
@@ -52,5 +50,6 @@ while True:
         break
     x = question2tensor(ques, config).to("cuda")
     out = model.generate(x)
+    print(out.shape)
     output = enc.decode(out.detach().cpu().numpy()[0])
     print("GPT-2:", output)
